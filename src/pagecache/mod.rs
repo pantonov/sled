@@ -21,7 +21,6 @@ use self::{
     blob_io::{gc_blobs, read_blob, remove_blob, write_blob},
     constants::{
         BATCH_MANIFEST_PID,
-        CONFIG_PID,
         COUNTER_PID,
         META_PID,
         //PAGE_CONSOLIDATION_THRESHOLD,
@@ -173,7 +172,7 @@ fn log_kind_from_update(update: &Update) -> LogKind {
     match update {
         Free => LogKind::Free,
         Append(..) => LogKind::Append,
-        Compact(..) | Counter(..) | Meta(..) | Config(..) => LogKind::Replace,
+        Compact(..) | Counter(..) | Meta(..) => LogKind::Replace,
     }
 }
 
@@ -291,7 +290,6 @@ pub(crate) enum Update {
     Free,
     Counter(u64),
     Meta(Meta),
-    Config(PersistedConfig),
 }
 
 impl Update {
@@ -301,7 +299,6 @@ impl Update {
         let bytes = match self {
             Update::Counter(c) => serialize(&c).unwrap(),
             Update::Meta(m) => serialize(&m).unwrap(),
-            Update::Config(c) => serialize(&c).unwrap(),
             Update::Free => vec![],
             other => serialize(other.as_frag()).unwrap(),
         };
@@ -653,30 +650,6 @@ impl PageCache {
                 );
             }
 
-            if let Err(Error::ReportableBug(..)) =
-                pc.get_persisted_config(&guard)
-            {
-                // set up idgen
-                was_recovered = false;
-
-                let config_update = Update::Config(PersistedConfig {
-                    segment_size: config.segment_size,
-                    use_compression: config.use_compression,
-                    version: config.version,
-                });
-
-                let (config_id, _) =
-                    pc.allocate_inner(config_update, &guard)?;
-
-                assert_eq!(
-                    config_id,
-                    CONFIG_PID,
-                    "we expect the counter to have pid {}, but it had pid {} instead",
-                    CONFIG_PID,
-                    config_id,
-                );
-            }
-
             let (_, counter) = pc.get_idgen(&guard)?;
             let idgen_recovery = if was_recovered {
                 counter + (2 * pc.config.idgen_persist_interval)
@@ -834,11 +807,7 @@ impl PageCache {
     ) -> Result<CasResult<'g, ()>> {
         trace!("attempting to free pid {}", pid);
 
-        if pid == COUNTER_PID
-            || pid == META_PID
-            || pid == CONFIG_PID
-            || pid == BATCH_MANIFEST_PID
-        {
+        if pid == COUNTER_PID || pid == META_PID || pid == BATCH_MANIFEST_PID {
             return Err(Error::ReportableBug(
                 "you are not able to free the first \
                  couple pages, which are allocated \
@@ -907,9 +876,9 @@ impl PageCache {
                     pid
                 );
                 if let Some((current_ptr, _frag, _sz)) = self.get(pid, guard)? {
-                    return Ok(Err(Some((current_ptr, new))));
+                    return Ok(Err((Some(current_ptr), frag)));
                 } else {
-                    return Ok(Err(None));
+                    return Ok(Err((None, frag)));
                 }
             }
         }
@@ -1081,9 +1050,9 @@ impl PageCache {
                     pid
                 );
                 if let Some((current_ptr, _frag, _sz)) = self.get(pid, guard)? {
-                    return Ok(Err(Some((current_ptr, new))));
+                    return Ok(Err((Some(current_ptr), new)));
                 } else {
-                    return Ok(Err(None));
+                    return Ok(Err((None, new)));
                 }
             }
         }
@@ -1096,8 +1065,13 @@ impl PageCache {
             guard,
         )?;
 
-        let result =
-            self.cas_page(pid, old, Update::Compact(new), false, guard)?;
+        let result = self.cas_page(
+            pid,
+            old_version,
+            Update::Compact(new),
+            false,
+            guard,
+        )?;
 
         let to_clean = self.log.with_sa(|sa| sa.clean(pid));
 
@@ -1132,99 +1106,98 @@ impl PageCache {
             Some(p) => p,
         };
 
-        debug_delay();
-        let (head, entries) = stack.head(&guard);
-
-        // if the page is just a single blob pointer, rewrite it.
-        if entries.len() == 1 && entries[0].1.ptr.is_blob() {
-            trace!("rewriting blob with pid {}", pid);
-            let blob_ptr = entries[0].1.ptr.blob().1;
-
-            let log_reservation = self.log.rewrite_blob_ptr(pid, blob_ptr)?;
-
-            let new_ptr = log_reservation.ptr();
-            let mut new_cache_entry = entries[0].clone();
-
-            new_cache_entry.1.ptr = new_ptr;
-
-            let node = vec![new_cache_entry];
-
+        /*
             debug_delay();
-            let result = stack.cas(head, node, &guard);
+            let (head, entries) = stack.head(&guard);
 
-            if result.is_ok() {
-                let ptrs = ptrs_from_stack(entries, guard);
-                let lsn = log_reservation.lsn();
+            // if the page is just a single blob pointer, rewrite it.
+            if entries.len() == 1 && entries[0].1.ptr.is_blob() {
+                trace!("rewriting blob with pid {}", pid);
+                let blob_ptr = entries[0].1.ptr.blob().1;
 
-                self.log
-                    .with_sa(|sa| sa.mark_replace(pid, lsn, ptrs, new_ptr))?;
+                let log_reservation = self.log.rewrite_blob_ptr(pid, blob_ptr)?;
 
-                // NB complete must happen AFTER calls to SA, because
-                // when the iobuf's n_writers hiversion 0, we may transition
-                // the segment to inactive, resulting in a race otherwise.
-                let _ptr = log_reservation.complete()?;
+                let new_ptr = log_reservation.ptr();
+                let mut new_cache_entry = entries[0].clone();
 
-                trace!("rewriting pid {} succeeded", pid);
+                new_cache_entry.1.ptr = new_ptr;
 
-                Ok(())
-            } else {
-                let _ptr = log_reservation.abort()?;
+                let node = vec![new_cache_entry];
 
-                trace!("rewriting pid {} failed", pid);
+                debug_delay();
+                let result = stack.cas(head, node, &guard);
 
-                Ok(())
-            }
-        } else {
-            trace!("rewriting page with pid {}", pid);
+                if result.is_ok() {
+                    let ptrs = ptrs_from_stack(entries, guard);
+                    let lsn = log_reservation.lsn();
 
-            // page-in whole page with a get
-            let (key, update): (_, Update) = if pid == META_PID {
-                let (key, meta) = self.get_meta(guard)?;
-                (key, Update::Meta(meta.clone()))
-            } else if pid == COUNTER_PID {
-                let (key, counter) = self.get_idgen(guard)?;
-                (key, Update::Counter(counter))
-            } else if pid == CONFIG_PID {
-                let (key, config) = self.get_persisted_config(guard)?;
-                (key, Update::Config(*config))
-            } else if let Some((key, frag, _sz)) = self.get(pid, guard)? {
-                (key, Update::Compact(frag.clone()))
-            } else {
-                let stack = match self.inner.get(pid) {
-                    None => panic!(
-                        "expected to find existing stack \
-                         for freed pid {}",
-                        pid
-                    ),
-                    Some(p) => p,
-                };
+                    self.log
+                        .with_sa(|sa| sa.mark_replace(pid, lsn, ptrs, new_ptr))?;
 
-                let (head, cache_entries) = stack.head(&guard);
+                    // NB complete must happen AFTER calls to SA, because
+                    // when the iobuf's n_writers hiversion 0, we may transition
+                    // the segment to inactive, resulting in a race otherwise.
+                    let _ptr = log_reservation.complete()?;
 
-                match cache_entries[0] {
-                    (Some(Update::Free), cache_info) => {
-                        (cache_info.version, Update::Free)
-                    }
-                    other => {
-                        debug!(
-                            "when rewriting pid {} \
-                             we encountered a rewritten \
-                             node with a frag {:?} that \
-                             we previously witnessed a Free \
-                             for (PageCache::get returned None), \
-                             assuming we can just return now since \
-                             the Free was replace'd",
-                            pid, other
-                        );
-                        return Ok(());
-                    }
+                    trace!("rewriting pid {} succeeded", pid);
+
+                    Ok(())
+                } else {
+                    let _ptr = log_reservation.abort()?;
+
+                    trace!("rewriting pid {} failed", pid);
+
+                    Ok(())
                 }
+            } else {
+        */
+        trace!("rewriting page with pid {}", pid);
+
+        // page-in whole page with a get
+        let (key, update): (_, Update) = if pid == META_PID {
+            let (key, meta) = self.get_meta(guard)?;
+            (key, Update::Meta(meta.clone()))
+        } else if pid == COUNTER_PID {
+            let (key, counter) = self.get_idgen(guard)?;
+            (key, Update::Counter(counter))
+        } else if let Some((key, frag, _sz)) = self.get(pid, guard)? {
+            (key, Update::Compact(frag.clone()))
+        } else {
+            let stack = match self.inner.get(pid) {
+                None => panic!(
+                    "expected to find existing stack \
+                     for freed pid {}",
+                    pid
+                ),
+                Some(p) => p,
             };
 
-            self.cas_page(pid, key, update, true, guard).map(|res| {
-                trace!("rewriting pid {} success: {}", pid, res.is_ok());
-            })
-        }
+            let (head, cache_entries) = stack.head(&guard);
+
+            match cache_entries[0] {
+                (Some(Update::Free), cache_info) => {
+                    (cache_info.version, Update::Free)
+                }
+                other => {
+                    debug!(
+                        "when rewriting pid {} \
+                         we encountered a rewritten \
+                         node with a frag {:?} that \
+                         we previously witnessed a Free \
+                         for (PageCache::get returned None), \
+                         assuming we can just return now since \
+                         the Free was replace'd",
+                        pid, other
+                    );
+                    return Ok(());
+                }
+            }
+        };
+
+        self.cas_page(pid, key, update, true, guard).map(|res| {
+            trace!("rewriting pid {} success: {}", pid, res.is_ok());
+        })
+        //    }
     }
 
     /// Traverses all files and calculates their total physical
@@ -1258,10 +1231,9 @@ impl PageCache {
         let guard = pin();
         let meta_size = self.meta(&guard)?.size_in_bytes();
         let idgen_size = std::mem::size_of::<u64>() as u64;
-        let config_size = self.get_persisted_config(&guard)?.1.size_in_bytes();
 
-        let mut ret = meta_size + idgen_size + config_size;
-        let min_pid = CONFIG_PID + 1;
+        let mut ret = meta_size + idgen_size;
+        let min_pid = COUNTER_PID + 1;
         let next_pid_to_allocate = self.next_pid_to_allocate.load(Acquire);
         for pid in min_pid..next_pid_to_allocate {
             if let Some((_, _, sz)) = self.get(pid, &guard)? {
@@ -1341,12 +1313,9 @@ impl PageCache {
                 trace!("cas_page failed on pid {}", pid);
                 let _ptr = log_reservation.abort()?;
 
-                let returned_update =
-                    returned_entry.into_box().inner.0.take().unwrap();
+                assert_ne!(Some(old_version), actual_version);
 
-                assert_ne!(old_version, actual_version);
-
-                return Ok(Err(Some((actual_version, returned_update))));
+                return Ok(Err((actual_version, returned_entry)));
             }
         } // match cas result
     }
@@ -1385,46 +1354,6 @@ impl PageCache {
             }
             _ => Err(Error::ReportableBug(
                 "failed to retrieve META page \
-                 which should always be present"
-                    .into(),
-            )),
-        }
-    }
-
-    /// Retrieve the current meta page
-    pub(crate) fn get_persisted_config<'g>(
-        &self,
-        guard: &'g Guard,
-    ) -> Result<(Version, &'g PersistedConfig)> {
-        trace!("getting page iter for persisted config");
-
-        let stack = match self.inner.get(CONFIG_PID) {
-            None => {
-                return Err(Error::ReportableBug(
-                    "failed to retrieve persisted config page \
-                     which should always be present"
-                        .into(),
-                ));
-            }
-            Some(p) => p,
-        };
-
-        let (head, cache_entries) = stack.head(&guard);
-
-        match cache_entries[0] {
-            Some((Some(Update::Config(config)), cache_info)) => {
-                Ok((cache_info.version, config))
-            }
-            Some((None, cache_info)) => {
-                let update =
-                    self.pull(CONFIG_PID, cache_info.lsn, cache_info.ptr)?;
-                let version = cache_info.version;
-                let _ =
-                    self.cas_page(CONFIG_PID, version, update, false, guard)?;
-                self.get_persisted_config(guard)
-            }
-            _ => Err(Error::ReportableBug(
-                "failed to retrieve CONFIG page \
                  which should always be present"
                     .into(),
             )),
@@ -1480,11 +1409,7 @@ impl PageCache {
         trace!("getting page iterator for pid {}", pid);
         let _measure = Measure::new(&M.get_page);
 
-        if pid == COUNTER_PID
-            || pid == META_PID
-            || pid == CONFIG_PID
-            || pid == BATCH_MANIFEST_PID
-        {
+        if pid == COUNTER_PID || pid == META_PID || pid == BATCH_MANIFEST_PID {
             return Err(Error::Unsupported(
                 "you are not able to iterate over \
                  the first couple pages, which are \
@@ -1807,7 +1732,6 @@ impl PageCache {
         'different_page_eviction: for pid in to_evict {
             if pid == COUNTER_PID
                 || pid == META_PID
-                || pid == CONFIG_PID
                 || pid == BATCH_MANIFEST_PID
             {
                 // should not page these suckas out
@@ -1898,9 +1822,6 @@ impl PageCache {
             Counter => deserialize::<u64>(&bytes).map(Update::Counter),
             BlobMeta | InlineMeta => {
                 deserialize::<Meta>(&bytes).map(Update::Meta)
-            }
-            BlobConfig | InlineConfig => {
-                deserialize::<PersistedConfig>(&bytes).map(Update::Config)
             }
             BlobAppend | InlineAppend => {
                 deserialize::<Frag>(&bytes).map(Update::Append)
