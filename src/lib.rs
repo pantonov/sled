@@ -118,8 +118,8 @@ mod stack;
 mod subscription;
 mod sys_limits;
 mod threadpool;
+mod transaction;
 mod tree;
-mod tx;
 mod vecset;
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -166,10 +166,11 @@ pub use self::{
     ivec::IVec,
     result::{Error, Result},
     subscription::{Event, Subscriber},
-    tree::{CompareAndSwapError, CompareAndSwapResult, Tree},
-    tx::{
+    transaction::{
+        abort, ConflictableTransactionError, ConflictableTransactionResult,
         TransactionError, TransactionResult, Transactional, TransactionalTree,
     },
+    tree::{CompareAndSwapError, CompareAndSwapResult, Tree},
 };
 
 use {
@@ -233,7 +234,7 @@ fn debug_delay() {}
 
 /// A fast map that is not resistant to collision attacks. Works
 /// on 8 bytes at a time.
-pub type FastMap8<K, V> = std::collections::HashMap<
+pub(crate) type FastMap8<K, V> = std::collections::HashMap<
     K,
     V,
     std::hash::BuildHasherDefault<fxhash::FxHasher64>,
@@ -241,7 +242,7 @@ pub type FastMap8<K, V> = std::collections::HashMap<
 
 /// A fast set that is not resistant to collision attacks. Works
 /// on 8 bytes at a time.
-pub type FastSet8<V> = std::collections::HashSet<
+pub(crate) type FastSet8<V> = std::collections::HashSet<
     V,
     std::hash::BuildHasherDefault<fxhash::FxHasher64>,
 >;
