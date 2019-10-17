@@ -109,6 +109,11 @@ impl Db {
                 root: AtomicU64::new(root),
                 concurrency_control: RwLock::new(()),
                 merge_operator: RwLock::new(None),
+                guards: {
+                    let mut v = vec![];
+                    v.resize_with(1024, Default::default);
+                    v
+                },
             }));
             assert!(tenants.insert(id, tree).is_none());
         }

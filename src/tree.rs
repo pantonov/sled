@@ -7,7 +7,7 @@ use std::{
     },
 };
 
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 
 use crate::Guard;
 
@@ -79,6 +79,7 @@ pub struct TreeInner {
     pub(crate) root: AtomicU64,
     pub(crate) concurrency_control: RwLock<()>,
     pub(crate) merge_operator: RwLock<Option<MergeOperator>>,
+    pub(crate) guards: Vec<Mutex<()>>,
 }
 
 impl std::ops::Deref for Tree {
@@ -124,7 +125,9 @@ impl Tree {
         K: AsRef<[u8]>,
         IVec: From<V>,
     {
-        let _ = self.concurrency_control.read();
+        // let _ = self.concurrency_control.read();
+        //let shard = crc32(key.as_ref()) as usize % 1024;
+        let _ = self.guards[0].lock();
         self.insert_inner(key, value)
     }
 

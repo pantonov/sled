@@ -57,6 +57,11 @@ pub(crate) fn open_tree(
                     root: AtomicU64::new(root_id),
                     concurrency_control: RwLock::new(()),
                     merge_operator: RwLock::new(None),
+                    guards: {
+                        let mut v = vec![];
+                        v.resize_with(1024, Default::default);
+                        v
+                    },
                 })));
             }
             Err(Error::CollectionNotFound(_)) => {}
@@ -110,6 +115,11 @@ pub(crate) fn open_tree(
             root: AtomicU64::new(root_id),
             concurrency_control: RwLock::new(()),
             merge_operator: RwLock::new(None),
+            guards: {
+                let mut v = vec![];
+                v.resize_with(1024, Default::default);
+                v
+            },
         })));
     }
 }
