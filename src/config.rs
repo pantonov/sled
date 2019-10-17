@@ -349,7 +349,7 @@ impl Config {
         // seal config in a Config
         let config = RunningConfig { inner: config, file: Arc::new(file) };
 
-        Db::start_inner(config)
+        Db::open_inner(config)
     }
 
     #[doc(hidden)]

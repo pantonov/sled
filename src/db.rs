@@ -65,10 +65,10 @@ impl Db {
     #[doc(hidden)]
     #[deprecated(since = "0.29.0", note = "please use Config::open instead")]
     pub fn start(config: RunningConfig) -> Result<Self> {
-        Db::start_inner(config)
+        Db::open_inner(config)
     }
 
-    pub(crate) fn start_inner(config: RunningConfig) -> Result<Self> {
+    pub(crate) fn open_inner(config: RunningConfig) -> Result<Self> {
         let _measure = Measure::new(&M.tree_start);
 
         let context = Context::start(config)?;
