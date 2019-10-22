@@ -57,8 +57,8 @@ use std::convert::{TryFrom, TryInto};
 #[cfg(feature = "compression")]
 use zstd::block::decompress;
 
-/// The offset of a segment. This equals iversion LogOffset (or the offset of any
-/// item contained inside it) divided by the configured segment_size.
+/// The offset of a segment. This equals iversion LogOffset (or the offset of
+/// any item contained inside it) divided by the configured segment_size.
 pub type SegmentId = usize;
 
 /// A file offset in the database log.
@@ -278,7 +278,7 @@ pub struct CacheInfo {
     pub version: Version,
     pub lsn: Lsn,
     pub ptr: DiskPtr,
-    pub log_size: usize,
+    pub log_size: u64,
 }
 
 /// Update<PageFragment> denotes a state or a change in a sequence of updates
@@ -324,20 +324,30 @@ impl Update {
         }
     }
 
-    fn is_compact(&self) -> bool {
-        if let Update::Compact(_) = self {
-            true
-        } else {
-            false
+    fn meta_ref(&self) -> &Meta {
+        match self {
+            Update::Meta(meta) => meta,
+            other => {
+                panic!("called as_frag on non-Append/Compact: {:?}", other)
+            }
         }
     }
 
-    fn is_free(&self) -> bool {
-        if let Update::Free = self {
-            true
-        } else {
-            false
+    fn counter(&self) -> u64 {
+        match self {
+            Update::Counter(counter) => *counter,
+            other => {
+                panic!("called as_frag on non-Append/Compact: {:?}", other)
+            }
         }
+    }
+
+    fn is_compact(&self) -> bool {
+        if let Update::Compact(_) = self { true } else { false }
+    }
+
+    fn is_free(&self) -> bool {
+        if let Update::Free = self { true } else { false }
     }
 }
 
@@ -374,6 +384,22 @@ pub struct Page {
     cache_infos: Vec<CacheInfo>,
 }
 
+impl Page {
+    fn version(&self) -> Option<u64> {
+        self.cache_infos.last().map(|ci| ci.version)
+    }
+
+    fn is_unallocated(&self) -> bool {
+        self.cache_infos.is_empty()
+    }
+
+    fn log_size(&self) -> u64 {
+        self.cache_infos
+            .iter()
+            .fold(0_u64, |(acc, ci)| acc.saturating_add(ci.log_size))
+    }
+}
+
 pub struct PageCell {
     inner: RwLock<Arc<Page>>,
 }
@@ -383,8 +409,21 @@ impl PageCell {
         PageCell { inner: RwLock::new(Arc::new(inner)) }
     }
 
-    pub fn get(&self) -> Arc<Page> {
-        self.inner.read().clone()
+    pub fn get(&self) -> Result<Arc<Page>> {
+        let read = self.inner.read();
+        if read.update.is_some() {
+            return Ok(read.clone());
+        }
+        drop(read);
+
+        let mut write = self.inner.write();
+        if write.update.is_some() {
+            return Ok(write.clone());
+        }
+        let mut fetching = Arc::make_mut(&mut write);
+        fetching.fetch()?;
+
+        Ok(write.clone());
     }
 
     pub fn get_view<F, V>(&self, f: F) -> View<V>
@@ -624,11 +663,9 @@ impl PageCache {
                 let (meta_id, _) = pc.allocate_inner(meta_update, &guard)?;
 
                 assert_eq!(
-                    meta_id,
-                    META_PID,
+                    meta_id, META_PID,
                     "we expect the meta page to have pid {}, but it had pid {} instead",
-                    META_PID,
-                    meta_id,
+                    META_PID, meta_id,
                 );
             }
 
@@ -642,11 +679,9 @@ impl PageCache {
                     pc.allocate_inner(counter_update, &guard)?;
 
                 assert_eq!(
-                    counter_id,
-                    COUNTER_PID,
+                    counter_id, COUNTER_PID,
                     "we expect the counter to have pid {}, but it had pid {} instead",
-                    COUNTER_PID,
-                    counter_id,
+                    COUNTER_PID, counter_id,
                 );
             }
 
@@ -832,7 +867,7 @@ impl PageCache {
             });
         }
 
-        Ok(new_version.map_err(|o| o.map(|(ptr, _)| (ptr, ()))))
+        Ok(new_version.map_err(|(version, _)| (version, ())))
     }
 
     /// Try to atomically add a `PageFrag` to the page.
@@ -1098,7 +1133,7 @@ impl PageCache {
 
         trace!("rewriting pid {}", pid);
 
-        let stack = match self.inner.get(pid) {
+        let page_cell = match self.inner.get(pid) {
             None => {
                 trace!("rewriting pid {} failed (no longer exisversion)", pid);
                 return Ok(());
@@ -1106,99 +1141,67 @@ impl PageCache {
             Some(p) => p,
         };
 
-        /*
-            debug_delay();
-            let (head, entries) = stack.head(&guard);
+        let mut page = page_cell.get();
 
-            // if the page is just a single blob pointer, rewrite it.
-            if entries.len() == 1 && entries[0].1.ptr.is_blob() {
-                trace!("rewriting blob with pid {}", pid);
-                let blob_ptr = entries[0].1.ptr.blob().1;
+        if page.update.is_none() {
+            return Ok(());
+        }
 
-                let log_reservation = self.log.rewrite_blob_ptr(pid, blob_ptr)?;
-
-                let new_ptr = log_reservation.ptr();
-                let mut new_cache_entry = entries[0].clone();
-
-                new_cache_entry.1.ptr = new_ptr;
-
-                let node = vec![new_cache_entry];
-
-                debug_delay();
-                let result = stack.cas(head, node, &guard);
-
-                if result.is_ok() {
-                    let ptrs = ptrs_from_stack(entries, guard);
-                    let lsn = log_reservation.lsn();
-
-                    self.log
-                        .with_sa(|sa| sa.mark_replace(pid, lsn, ptrs, new_ptr))?;
-
-                    // NB complete must happen AFTER calls to SA, because
-                    // when the iobuf's n_writers hiversion 0, we may transition
-                    // the segment to inactive, resulting in a race otherwise.
-                    let _ptr = log_reservation.complete()?;
-
-                    trace!("rewriting pid {} succeeded", pid);
-
-                    Ok(())
-                } else {
-                    let _ptr = log_reservation.abort()?;
-
-                    trace!("rewriting pid {} failed", pid);
-
-                    Ok(())
-                }
-            } else {
-        */
-        trace!("rewriting page with pid {}", pid);
-
-        // page-in whole page with a get
-        let (key, update): (_, Update) = if pid == META_PID {
-            let (key, meta) = self.get_meta(guard)?;
-            (key, Update::Meta(meta.clone()))
-        } else if pid == COUNTER_PID {
-            let (key, counter) = self.get_idgen(guard)?;
-            (key, Update::Counter(counter))
-        } else if let Some((key, frag, _sz)) = self.get(pid, guard)? {
-            (key, Update::Compact(frag.clone()))
-        } else {
-            let stack = match self.inner.get(pid) {
-                None => panic!(
-                    "expected to find existing stack \
-                     for freed pid {}",
-                    pid
-                ),
-                Some(p) => p,
-            };
-
-            let (head, cache_entries) = stack.head(&guard);
-
-            match cache_entries[0] {
-                (Some(Update::Free), cache_info) => {
-                    (cache_info.version, Update::Free)
-                }
-                other => {
-                    debug!(
-                        "when rewriting pid {} \
-                         we encountered a rewritten \
-                         node with a frag {:?} that \
-                         we previously witnessed a Free \
-                         for (PageCache::get returned None), \
-                         assuming we can just return now since \
-                         the Free was replace'd",
-                        pid, other
-                    );
-                    return Ok(());
-                }
-            }
-        };
-
+        let update = page.update.take().unwrap();
+        let key = page.version().expect(
+            "if a page is being rewritten, it should \
+             have some associated version",
+        );
         self.cas_page(pid, key, update, true, guard).map(|res| {
             trace!("rewriting pid {} success: {}", pid, res.is_ok());
         })
-        //    }
     }
+
+    /*
+        debug_delay();
+        let (head, entries) = stack.head(&guard);
+
+        // if the page is just a single blob pointer, rewrite it.
+        if entries.len() == 1 && entries[0].1.ptr.is_blob() {
+            trace!("rewriting blob with pid {}", pid);
+            let blob_ptr = entries[0].1.ptr.blob().1;
+
+            let log_reservation = self.log.rewrite_blob_ptr(pid, blob_ptr)?;
+
+            let new_ptr = log_reservation.ptr();
+            let mut new_cache_entry = entries[0].clone();
+
+            new_cache_entry.1.ptr = new_ptr;
+
+            let node = vec![new_cache_entry];
+
+            debug_delay();
+            let result = stack.cas(head, node, &guard);
+
+            if result.is_ok() {
+                let ptrs = ptrs_from_stack(entries, guard);
+                let lsn = log_reservation.lsn();
+
+                self.log
+                    .with_sa(|sa| sa.mark_replace(pid, lsn, ptrs, new_ptr))?;
+
+                // NB complete must happen AFTER calls to SA, because
+                // when the iobuf's n_writers hiversion 0, we may transition
+                // the segment to inactive, resulting in a race otherwise.
+                let _ptr = log_reservation.complete()?;
+
+                trace!("rewriting pid {} succeeded", pid);
+
+                Ok(())
+            } else {
+                let _ptr = log_reservation.abort()?;
+
+                trace!("rewriting pid {} failed", pid);
+
+                Ok(())
+            }
+        } else {
+    */
 
     /// Traverses all files and calculates their total physical
     /// size, then traverses all pages and calculates their
@@ -1324,10 +1327,10 @@ impl PageCache {
     pub(crate) fn get_meta<'g>(
         &self,
         guard: &'g Guard,
-    ) -> Result<(Version, &'g Meta)> {
+    ) -> Result<(Version, View<Meta>)> {
         trace!("getting page iter for META");
 
-        let stack = match self.inner.get(META_PID) {
+        let page_cell = match self.inner.get(META_PID) {
             None => {
                 return Err(Error::ReportableBug(
                     "failed to retrieve META page \
@@ -1338,25 +1341,15 @@ impl PageCache {
             Some(p) => p,
         };
 
-        let (head, entries) = stack.head(&guard);
+        let page = page_cell.get();
 
-        match entries[0] {
-            Some((Some(Update::Meta(m)), cache_info)) => {
-                Ok((cache_info.version, m))
-            }
-            Some((None, cache_info)) => {
-                let update =
-                    self.pull(META_PID, cache_info.lsn, cache_info.ptr)?;
-                let version = cache_info.version;
-                let _ =
-                    self.cas_page(META_PID, version, update, false, guard)?;
-                self.get_meta(guard)
-            }
-            _ => Err(Error::ReportableBug(
-                "failed to retrieve META page \
-                 which should always be present"
-                    .into(),
-            )),
+        if page.update.is_some() {
+            Ok((
+                page.version().unwrap(),
+                View::new(page, |p| p.update.unwrap().meta_ref()),
+            ))
+        } else {
+            unimplemented!()
         }
     }
 
@@ -1367,36 +1360,23 @@ impl PageCache {
     ) -> Result<(Version, u64)> {
         trace!("getting page iter for idgen");
 
-        let stack = match self.inner.get(COUNTER_PID) {
+        let page_cell = match self.inner.get(COUNTER_PID) {
             None => {
                 return Err(Error::ReportableBug(
                     "failed to retrieve idgen page \
                      which should always be present"
                         .into(),
-                ))
+                ));
             }
             Some(p) => p,
         };
 
-        let (head, cache_entries) = stack.head(&guard);
+        let page = page_cell.get();
 
-        match cache_entries[0] {
-            Some((Some(Update::Counter(counter)), cache_info)) => {
-                Ok((cache_info.version, counter))
-            }
-            Some((None, cache_info)) => {
-                let update =
-                    self.pull(COUNTER_PID, cache_info.lsn, cache_info.ptr)?;
-                let version = cache_info.version;
-                let _ =
-                    self.cas_page(COUNTER_PID, version, update, false, guard)?;
-                self.get_idgen(guard)
-            }
-            _ => Err(Error::ReportableBug(
-                "failed to retrieve idgen page \
-                 which should always be present"
-                    .into(),
-            )),
+        if page.update.is_some() {
+            Ok((page.version().unwrap(), page.update.unwrap().counter()))
+        } else {
+            unimplemented!()
         }
     }
 
@@ -1419,27 +1399,20 @@ impl PageCache {
             ));
         }
 
-        let stack = match self.inner.get(pid) {
+        let page_cell = match self.inner.get(pid) {
             None => return Ok(None),
             Some(p) => p,
         };
 
-        let (head, entries) = stack.head(&guard);
+        let page = page_cell.get();
 
-        let is_free = if let Some((Some(entry), _)) = entries.first() {
-            entry.is_free()
-        } else {
-            false
-        };
+        let is_free = Some(Update::Free) == page.update;
 
-        if entries.is_empty() || is_free {
+        if page.is_unallocated() || is_free {
             return Ok(None);
         }
 
-        let total_page_size = entries
-            .iter()
-            .map(|(_, cache_info)| cache_info.log_size as u64)
-            .sum();
+        let total_page_size = page.log_size();
 
         let initial_base = match entries[0] {
             (Some(Update::Compact(compact)), cache_info) => {
