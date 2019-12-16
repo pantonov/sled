@@ -179,6 +179,7 @@ mod config;
 mod context;
 mod db;
 mod dll;
+mod epoch;
 mod fastlock;
 mod histogram;
 mod iter;

@@ -58,7 +58,7 @@ impl<T: Send + 'static> Drop for Stack<T> {
 
 impl<T> Debug for Stack<T>
 where
-    T: Clone + Debug + Send + 'static + Sync,
+    T: Debug + Send + 'static,
 {
     fn fmt(
         &self,
@@ -90,7 +90,7 @@ impl<T: Send + 'static> Deref for Node<T> {
     }
 }
 
-impl<T: Clone + Send + Sync + 'static> Stack<T> {
+impl<T: Send + 'static> Stack<T> {
     /// Add an item to the stack, spinning until successful.
     pub fn push(&self, inner: T, guard: &Guard) {
         debug_delay();
@@ -169,7 +169,7 @@ impl<T: Clone + Send + Sync + 'static> Stack<T> {
 /// An iterator over nodes in a lock-free stack.
 pub struct StackIter<'a, T>
 where
-    T: Send + 'static + Sync,
+    T: Send + 'static,
 {
     inner: Shared<'a, Node<T>>,
     guard: &'a Guard,
@@ -177,7 +177,7 @@ where
 
 impl<'a, T> StackIter<'a, T>
 where
-    T: 'a + Send + 'static + Sync,
+    T: 'a + Send + 'static,
 {
     /// Creates a `StackIter` from a pointer to one.
     pub fn from_ptr<'b>(
@@ -190,7 +190,7 @@ where
 
 impl<'a, T> Iterator for StackIter<'a, T>
 where
-    T: Send + 'static + Sync,
+    T: Send + 'static,
 {
     type Item = &'a T;
 
