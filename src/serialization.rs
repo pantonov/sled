@@ -742,11 +742,11 @@ mod qc {
     impl Arbitrary for MessageHeader {
         fn arbitrary<G: Gen>(g: &mut G) -> MessageHeader {
             MessageHeader {
-                crc32: g.gen(),
-                len: g.gen(),
+                crc32: SpreadU32::arbitrary(g).0,
+                len: SpreadU64::arbitrary(g).0,
                 kind: MessageKind::arbitrary(g),
                 segment_number: SegmentNumber(SpreadU64::arbitrary(g).0),
-                pid: g.gen(),
+                pid: SpreadU64::arbitrary(g).0,
             }
         }
     }
@@ -776,10 +776,12 @@ mod qc {
 
     impl Arbitrary for Node {
         fn arbitrary<G: Gen>(g: &mut G) -> Node {
-            let next_raw: Option<u64> = Arbitrary::arbitrary(g);
+            let next_raw: Option<u64> =
+                if g.gen() { Some(SpreadU64::arbitrary(g).0) } else { None };
             let next = next_raw.map(|v| std::cmp::max(v, 1));
 
-            let merging_child_raw: Option<u64> = Arbitrary::arbitrary(g);
+            let merging_child_raw: Option<u64> =
+                if g.gen() { Some(SpreadU64::arbitrary(g).0) } else { None };
             let merging_child = merging_child_raw.map(|v| std::cmp::max(v, 1));
 
             Node {
@@ -852,9 +854,12 @@ mod qc {
     impl Arbitrary for DiskPtr {
         fn arbitrary<G: Gen>(g: &mut G) -> DiskPtr {
             if g.gen() {
-                DiskPtr::Inline(g.gen())
+                DiskPtr::Inline(SpreadU64::arbitrary(g).0)
             } else {
-                DiskPtr::Blob(g.gen(), g.gen())
+                DiskPtr::Blob(
+                    SpreadU64::arbitrary(g).0,
+                    SpreadI64::arbitrary(g).0,
+                )
             }
         }
     }
@@ -866,11 +871,20 @@ mod qc {
                 let n = std::cmp::max(1, g.gen::<u8>());
 
                 let items = (0..n)
-                    .map(|_| (g.gen(), DiskPtr::arbitrary(g), g.gen()))
+                    .map(|_| {
+                        (
+                            SpreadI64::arbitrary(g).0,
+                            DiskPtr::arbitrary(g),
+                            SpreadU64::arbitrary(g).0,
+                        )
+                    })
                     .collect();
                 PageState::Present(items)
             } else {
-                PageState::Free(g.gen(), DiskPtr::arbitrary(g))
+                PageState::Free(
+                    SpreadI64::arbitrary(g).0,
+                    DiskPtr::arbitrary(g),
+                )
             }
         }
     }
@@ -878,9 +892,9 @@ mod qc {
     impl Arbitrary for Snapshot {
         fn arbitrary<G: Gen>(g: &mut G) -> Snapshot {
             Snapshot {
-                last_lsn: g.gen(),
-                last_lid: g.gen(),
-                max_header_stable_lsn: g.gen(),
+                last_lsn: SpreadI64::arbitrary(g).0,
+                last_lid: SpreadU64::arbitrary(g).0,
+                max_header_stable_lsn: SpreadI64::arbitrary(g).0,
                 pt: Arbitrary::arbitrary(g),
             }
         }
@@ -894,6 +908,17 @@ mod qc {
             let uniform = g.gen::<i64>();
             let shift = g.gen_range(0, 64);
             SpreadI64(uniform >> shift)
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct SpreadU32(u32);
+
+    impl Arbitrary for SpreadU32 {
+        fn arbitrary<G: Gen>(g: &mut G) -> SpreadU32 {
+            let uniform = g.gen::<u32>();
+            let shift = g.gen_range(0, 32);
+            SpreadU32(uniform >> shift)
         }
     }
 
