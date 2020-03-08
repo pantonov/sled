@@ -131,7 +131,6 @@ impl<'a> Reservation<'a> {
                 std::mem::size_of::<u32>(),
             );
         }
-        self.log.exit_reservation(&self.iobuf)?;
 
         Ok((self.lsn(), self.pointer()))
     }

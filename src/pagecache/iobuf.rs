@@ -5,11 +5,6 @@ use std::{
 
 use crate::{pagecache::*, *};
 
-// This is the most writers in a single IO buffer
-// that we have space to accommodate in the counter
-// for writers in the IO buffer header.
-pub(in crate::pagecache) const MAX_WRITERS: Header = 127;
-
 pub(in crate::pagecache) type Header = u64;
 
 macro_rules! io_fail {
@@ -29,6 +24,8 @@ macro_rules! io_fail {
         });
     };
 }
+
+const SEAL_BIT: u64 = 1 << 32;
 
 struct AlignedBuf(*mut u8, usize);
 
@@ -68,10 +65,40 @@ pub(crate) struct IoBuf {
     maxed: AtomicBool,
     linearizer: Mutex<()>,
     stored_max_stable_lsn: Lsn,
+    iobufs: Arc<IoBufs>,
 }
 
 #[allow(unsafe_code)]
 unsafe impl Sync for IoBuf {}
+
+impl Drop for IoBuf {
+    fn drop(&mut self) {
+        if let Err(e) = self.iobufs.config.global_error() {
+            error!("skipping write of IoBuf during drop due to global error set: {:?}", e);
+            return;
+        }
+        trace!(
+            "asynchronously writing iobuf with lsn {} to log from maybe_seal",
+            self.lsn
+        );
+        let iobufs = self.iobufs.clone();
+
+        if let Err(e) = self.iobufs.write_to_log(&self) {
+            error!(
+                "hit error while writing iobuf with lsn {}: {:?}",
+                self.lsn, e
+            );
+            let intervals = iobufs.intervals.lock();
+
+            // having held the mutex makes this linearized
+            // with the notify below.
+            drop(intervals);
+
+            let _notified = iobufs.interval_updated.notify_all();
+            iobufs.config.set_global_error(e);
+        }
+    }
+}
 
 impl IoBuf {
     pub(crate) fn get_mut_range(
@@ -82,6 +109,20 @@ impl IoBuf {
         assert!(self.buf.1 >= at + len);
         unsafe {
             std::slice::from_raw_parts_mut(self.buf.0.add(self.base + at), len)
+        }
+    }
+
+    pub(crate) fn maybe_reserve(&self, len: usize) -> Option<usize> {
+        let added = self.header.fetch_add(len as u64, SeqCst);
+        let over_capacity = added + len as u64 > self.capacity as u64;
+        if over_capacity {
+            self.header.fetch_or(SEAL_BIT, SeqCst);
+        }
+        if is_sealed(added) || over_capacity {
+            self.header.fetch_sub(len as u64, SeqCst);
+            None
+        } else {
+            Some(offset(added))
         }
     }
 
@@ -99,12 +140,7 @@ impl IoBuf {
     // We write a new segment header to the beginning of the buffer
     // for assistance during recovery. The caller is responsible
     // for ensuring that the IoBuf's capacity has been set properly.
-    fn store_segment_header(
-        &mut self,
-        last: Header,
-        lsn: Lsn,
-        max_stable_lsn: Lsn,
-    ) {
+    fn store_segment_header(&mut self, lsn: Lsn, max_stable_lsn: Lsn) {
         debug!("storing lsn {} in beginning of buffer", lsn);
         assert!(self.capacity >= SEG_HEADER_LEN);
 
@@ -123,12 +159,6 @@ impl IoBuf {
                 SEG_HEADER_LEN,
             );
         }
-
-        // ensure writes to the buffer land after our header.
-        let last_salt = salt(last);
-        let new_salt = bump_salt(last_salt);
-        let bumped = bump_offset(new_salt, SEG_HEADER_LEN);
-        self.set_header(bumped);
     }
 
     pub(crate) fn set_maxed(&self, maxed: bool) {
@@ -144,11 +174,6 @@ impl IoBuf {
     pub(crate) fn get_header(&self) -> Header {
         debug_delay();
         self.header.load(SeqCst)
-    }
-
-    pub(crate) fn set_header(&self, new: Header) {
-        debug_delay();
-        self.header.store(new, SeqCst);
     }
 
     pub(crate) fn cas_header(
@@ -212,7 +237,10 @@ impl Drop for IoBufs {
 /// `IoBufs` is a set of lock-free buffers for coordinating
 /// writes to underlying storage.
 impl IoBufs {
-    pub fn start(config: RunningConfig, snapshot: &Snapshot) -> Result<IoBufs> {
+    pub fn start(
+        config: RunningConfig,
+        snapshot: &Snapshot,
+    ) -> Result<Arc<IoBufs>> {
         // open file for writing
         let file = &config.file;
 
@@ -224,12 +252,11 @@ impl IoBufs {
 
         let segment_cleaner = SegmentCleaner::default();
 
-        let mut segment_accountant: SegmentAccountant =
-            SegmentAccountant::start(
-                config.clone(),
-                snapshot,
-                segment_cleaner.clone(),
-            )?;
+        let segment_accountant: SegmentAccountant = SegmentAccountant::start(
+            config.clone(),
+            snapshot,
+            segment_cleaner.clone(),
+        )?;
 
         let (next_lsn, next_lid) =
             if snapshot_last_lsn % segment_size as Lsn == 0 {
@@ -276,13 +303,35 @@ impl IoBufs {
         // of our file has not yet been written.
         let stable = next_lsn - 1;
 
+        let iobufs = Arc::new(IoBufs {
+            config: config.clone(),
+
+            iobuf: AtomicPtr::default(),
+
+            intervals: Mutex::new(vec![]),
+            interval_updated: Condvar::new(),
+
+            stable_lsn: AtomicLsn::new(stable),
+            max_reserved_lsn: AtomicLsn::new(stable),
+            max_header_stable_lsn: Arc::new(AtomicLsn::new(
+                snapshot_max_header_stable_lsn,
+            )),
+            segment_accountant: Mutex::new(segment_accountant),
+            segment_cleaner,
+            deferred_segment_ops: stack::Stack::default(),
+            #[cfg(feature = "io_uring")]
+            submission_mutex: Mutex::new(()),
+            #[cfg(feature = "io_uring")]
+            io_uring: rio::new()?,
+        });
+
         let iobuf = if next_lsn % config.segment_size as Lsn == 0 {
             // allocate new segment for data
 
             if next_lsn == 0 {
                 assert_eq!(next_lid, 0);
             }
-            let lid = segment_accountant.next(next_lsn)?;
+            let lid = iobufs.segment_accountant.lock().next(next_lsn)?;
             if next_lsn == 0 {
                 assert_eq!(0, lid);
             }
@@ -302,9 +351,10 @@ impl IoBufs {
                 maxed: AtomicBool::new(false),
                 linearizer: Mutex::new(()),
                 stored_max_stable_lsn: -1,
+                iobufs: iobufs.clone(),
             };
 
-            iobuf.store_segment_header(0, next_lsn, stable);
+            iobuf.store_segment_header(next_lsn, stable);
 
             iobuf
         } else {
@@ -326,33 +376,15 @@ impl IoBufs {
                 maxed: AtomicBool::new(false),
                 linearizer: Mutex::new(()),
                 stored_max_stable_lsn: -1,
+                iobufs: iobufs.clone(),
             }
         };
 
         // remove all blob files larger than our stable offset
         gc_blobs(&config, stable)?;
+        iobufs.iobuf.swap(Arc::into_raw(Arc::new(iobuf)) as *mut IoBuf, SeqCst);
 
-        Ok(IoBufs {
-            config,
-
-            iobuf: AtomicPtr::new(Arc::into_raw(Arc::new(iobuf)) as *mut IoBuf),
-
-            intervals: Mutex::new(vec![]),
-            interval_updated: Condvar::new(),
-
-            stable_lsn: AtomicLsn::new(stable),
-            max_reserved_lsn: AtomicLsn::new(stable),
-            max_header_stable_lsn: Arc::new(AtomicLsn::new(
-                snapshot_max_header_stable_lsn,
-            )),
-            segment_accountant: Mutex::new(segment_accountant),
-            segment_cleaner,
-            deferred_segment_ops: stack::Stack::default(),
-            #[cfg(feature = "io_uring")]
-            submission_mutex: Mutex::new(()),
-            #[cfg(feature = "io_uring")]
-            io_uring: rio::new()?,
-        })
+        Ok(iobufs)
     }
 
     pub(in crate::pagecache) fn sa_mark_peg(
@@ -935,20 +967,17 @@ pub(in crate::pagecache) fn maybe_seal_and_write_iobuf(
         return Ok(());
     }
 
-    let sealed = mk_sealed(header);
-    let res_len = offset(sealed);
+    let previous = iobuf.header.fetch_or(SEAL_BIT, SeqCst);
+    if is_sealed(previous) {
+        return Ok(());
+    }
+
+    let res_len = offset(previous);
 
     let maxed = from_reserve || capacity - res_len < MAX_MSG_HEADER_LEN;
 
-    let worked = iobuf.linearized(|| {
-        if iobuf.cas_header(header, sealed).is_err() {
-            // cas failed, don't try to continue
-            return false;
-        }
-
-        trace!("sealed iobuf with lsn {}", lsn);
-
-        if maxed {
+    if maxed {
+        iobuf.linearized(|| {
             // NB we linearize this together with sealing
             // the header here to guarantee that in write_to_log,
             // which may be executing as soon as the seal is set
@@ -956,11 +985,7 @@ pub(in crate::pagecache) fn maybe_seal_and_write_iobuf(
             // iobuf.get_maxed() is linearized with this one!
             trace!("setting maxed to true for iobuf with lsn {}", lsn);
             iobuf.set_maxed(true);
-        }
-        true
-    });
-    if !worked {
-        return Ok(());
+        });
     }
 
     assert!(
@@ -1036,21 +1061,20 @@ pub(in crate::pagecache) fn maybe_seal_and_write_iobuf(
             maxed: AtomicBool::new(false),
             linearizer: Mutex::new(()),
             stored_max_stable_lsn: -1,
+            iobufs: iobufs.clone(),
         };
 
-        next_iobuf.store_segment_header(sealed, next_lsn, iobufs.stable());
+        next_iobuf.store_segment_header(next_lsn, iobufs.stable());
 
         next_iobuf
     } else {
         let new_cap = capacity - res_len;
         assert_ne!(new_cap, 0);
-        let last_salt = salt(sealed);
-        let new_salt = bump_salt(last_salt);
 
         IoBuf {
             // reuse the previous io buffer
             buf: iobuf.buf.clone(),
-            header: CachePadded::new(AtomicU64::new(new_salt)),
+            header: CachePadded::new(AtomicU64::new(0)),
             base: iobuf.base + res_len,
             offset: next_offset,
             lsn: next_lsn,
@@ -1058,6 +1082,7 @@ pub(in crate::pagecache) fn maybe_seal_and_write_iobuf(
             maxed: AtomicBool::new(false),
             linearizer: Mutex::new(()),
             stored_max_stable_lsn: -1,
+            iobufs: iobufs.clone(),
         }
     };
 
@@ -1082,39 +1107,7 @@ pub(in crate::pagecache) fn maybe_seal_and_write_iobuf(
 
     drop(measure_assign_offset);
 
-    // if writers is 0, it's our responsibility to write the buffer.
-    if n_writers(sealed) == 0 {
-        iobufs.config.global_error()?;
-        trace!(
-            "asynchronously writing iobuf with lsn {} to log from maybe_seal",
-            lsn
-        );
-        let iobufs = iobufs.clone();
-        let iobuf = iobuf.clone();
-        let _result = threadpool::spawn(move || {
-            if let Err(e) = iobufs.write_to_log(&iobuf) {
-                error!(
-                    "hit error while writing iobuf with lsn {}: {:?}",
-                    lsn, e
-                );
-                let intervals = iobufs.intervals.lock();
-
-                // having held the mutex makes this linearized
-                // with the notify below.
-                drop(intervals);
-
-                let _notified = iobufs.interval_updated.notify_all();
-                iobufs.config.set_global_error(e);
-            }
-        });
-
-        #[cfg(feature = "event_log")]
-        _result.unwrap();
-
-        Ok(())
-    } else {
-        Ok(())
-    }
+    Ok(())
 }
 
 impl Debug for IoBufs {
@@ -1133,10 +1126,9 @@ impl Debug for IoBuf {
     ) -> std::result::Result<(), fmt::Error> {
         let header = self.get_header();
         formatter.write_fmt(format_args!(
-            "\n\tIoBuf {{ lid: {}, n_writers: {}, offset: \
+            "\n\tIoBuf {{ lid: {}, offset: \
              {}, sealed: {} }}",
             self.offset,
-            n_writers(header),
             offset(header),
             is_sealed(header)
         ))
@@ -1144,27 +1136,7 @@ impl Debug for IoBuf {
 }
 
 pub(crate) const fn is_sealed(v: Header) -> bool {
-    v & 1 << 31 == 1 << 31
-}
-
-pub(crate) const fn mk_sealed(v: Header) -> Header {
-    v | 1 << 31
-}
-
-pub(crate) const fn n_writers(v: Header) -> Header {
-    v << 33 >> 57
-}
-
-#[inline]
-pub(crate) fn incr_writers(v: Header) -> Header {
-    assert_ne!(n_writers(v), MAX_WRITERS);
-    v + (1 << 24)
-}
-
-#[inline]
-pub(crate) fn decr_writers(v: Header) -> Header {
-    assert_ne!(n_writers(v), 0);
-    v - (1 << 24)
+    v & SEAL_BIT != 0
 }
 
 #[inline]
@@ -1177,12 +1149,4 @@ pub(crate) fn offset(v: Header) -> usize {
 pub(crate) fn bump_offset(v: Header, by: usize) -> Header {
     assert_eq!(by >> 24, 0);
     v + (by as Header)
-}
-
-pub(crate) const fn bump_salt(v: Header) -> Header {
-    (v + (1 << 32)) & 0xFFFF_FFFF_0000_0000
-}
-
-pub(crate) const fn salt(v: Header) -> Header {
-    v >> 32 << 32
 }

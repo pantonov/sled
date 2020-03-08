@@ -4,7 +4,7 @@ use std::sync::Arc;
 use super::{
     arr_to_lsn, arr_to_u32, assert_usize, bump_atomic_lsn, iobuf, lsn_to_arr,
     maybe_decompress, pread_exact, pread_exact_or_eof, read_blob, u32_to_arr,
-    BasedBuf, BlobPointer, DiskPtr, IoBuf, IoBufs, LogKind, LogOffset, Lsn,
+    BasedBuf, BlobPointer, DiskPtr, IoBufs, LogKind, LogOffset, Lsn,
     MessageKind, Reservation, Serialize, Snapshot, BATCH_MANIFEST_PID,
     COUNTER_PID, MAX_MSG_HEADER_LEN, META_PID, MINIMUM_ITEMS_PER_SEGMENT,
     SEG_HEADER_LEN,
@@ -27,7 +27,7 @@ impl Log {
     /// Start the log, open or create the configured file,
     /// and optionally start the periodic buffer flush thread.
     pub fn start(config: RunningConfig, snapshot: &Snapshot) -> Result<Self> {
-        let iobufs = Arc::new(IoBufs::start(config.clone(), snapshot)?);
+        let iobufs = IoBufs::start(config.clone(), snapshot)?;
 
         Ok(Self { iobufs, config })
     }
@@ -296,19 +296,7 @@ impl Log {
             // attempt to claim by incrementing an unsealed header
             let bumped_offset = iobuf::bump_offset(header, inline_buf_len);
 
-            // check for maxed out IO buffer writers
-            if iobuf::n_writers(bumped_offset) == iobuf::MAX_WRITERS {
-                trace_once!(
-                    "spinning because our buffer has {} writers already",
-                    iobuf::MAX_WRITERS
-                );
-                backoff.snooze();
-                continue;
-            }
-
-            let claimed = iobuf::incr_writers(bumped_offset);
-
-            if iobuf.cas_header(header, claimed).is_err() {
+            if iobuf.cas_header(header, bumped_offset).is_err() {
                 // CAS failed, start over
                 trace_once!("CAS failed while claiming buffer slot, spinning");
                 backoff.spin();
@@ -317,12 +305,8 @@ impl Log {
 
             let log_offset = iobuf.offset;
 
-            // if we're giving out a reservation,
-            // the writer count should be positive
-            assert_ne!(iobuf::n_writers(claimed), 0);
-
             // should never have claimed a sealed buffer
-            assert!(!iobuf::is_sealed(claimed));
+            assert!(!iobuf::is_sealed(bumped_offset));
 
             // MAX is used to signify unreadiness of
             // the underlying IO buffer, and if it's
@@ -380,68 +364,6 @@ impl Log {
                 header_len: usize::try_from(message_header.serialized_size())
                     .unwrap(),
             });
-        }
-    }
-
-    /// Called by Reservation on termination (completion or abort).
-    /// Handles departure from shared state, and possibly writing
-    /// the buffer to stable storage if necessary.
-    pub(super) fn exit_reservation(&self, iobuf: &Arc<IoBuf>) -> Result<()> {
-        let mut header = iobuf.get_header();
-
-        // Decrement writer count, retrying until successful.
-        loop {
-            let new_hv = iobuf::decr_writers(header);
-            match iobuf.cas_header(header, new_hv) {
-                Ok(new) => {
-                    header = new;
-                    break;
-                }
-                Err(new) => {
-                    // we failed to decr, retry
-                    header = new;
-                }
-            }
-        }
-
-        // Succeeded in decrementing writers, if we decremented writn
-        // to 0 and it's sealed then we should write it to storage.
-        if iobuf::n_writers(header) == 0 && iobuf::is_sealed(header) {
-            if let Err(e) = self.config.global_error() {
-                let intervals = self.iobufs.intervals.lock();
-
-                // having held the mutex makes this linearized
-                // with the notify below.
-                drop(intervals);
-
-                let _notified = self.iobufs.interval_updated.notify_all();
-                return Err(e);
-            }
-
-            let lsn = iobuf.lsn;
-            trace!(
-                "asynchronously writing iobuf with lsn {} \
-                 to log from exit_reservation",
-                lsn
-            );
-            let iobufs = self.iobufs.clone();
-            let iobuf = iobuf.clone();
-            let _result = threadpool::spawn(move || {
-                if let Err(e) = iobufs.write_to_log(&iobuf) {
-                    error!(
-                        "hit error while writing iobuf with lsn {}: {:?}",
-                        lsn, e
-                    );
-                    iobufs.config.set_global_error(e);
-                }
-            });
-
-            #[cfg(test)]
-            _result.unwrap();
-
-            Ok(())
-        } else {
-            Ok(())
         }
     }
 }
