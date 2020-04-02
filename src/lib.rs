@@ -192,6 +192,7 @@ mod meta;
 mod metrics;
 mod node;
 mod oneshot;
+mod op_queue;
 mod pagecache;
 mod prefix;
 mod result;
@@ -289,6 +290,7 @@ use {
         metrics::{clock, Measure, M},
         node::{Data, Node},
         oneshot::{OneShot, OneShotFiller},
+        op_queue::OpQueue,
         result::CasResult,
         stackvec::StackVec,
         subscription::Subscriptions,

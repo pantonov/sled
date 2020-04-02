@@ -353,7 +353,7 @@ impl Tree {
         // when the peg drops, it ensures all updates
         // written to the log since its creation are
         // recovered atomically
-        peg.seal_batch(guard)
+        peg.seal_batch()
     }
 
     /// Retrieve a value from the `Tree` if it exists.

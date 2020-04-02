@@ -3,10 +3,16 @@
 use std::{
     fmt::{self, Debug},
     ops::Deref,
-    sync::atomic::Ordering::{Acquire, Release},
+    sync::atomic::Ordering::Acquire,
 };
 
-use crossbeam_epoch::{unprotected, Atomic, Guard, Owned, Shared};
+#[cfg(feature = "event_log")]
+use std::sync::atomic::Ordering::Release;
+
+use crossbeam_epoch::{unprotected, Atomic, Guard, Shared};
+
+#[cfg(feature = "event_log")]
+use crossbeam_epoch::Owned;
 
 use crate::debug_delay;
 
@@ -92,6 +98,7 @@ impl<T: Send + 'static> Deref for Node<T> {
 
 impl<T: Send + Sync + 'static> Stack<T> {
     /// Add an item to the stack, spinning until successful.
+    #[cfg(feature = "event_log")]
     pub fn push(&self, inner: T, guard: &Guard) {
         debug_delay();
         let node = Owned::new(Node { inner, next: Atomic::null() });
@@ -108,25 +115,6 @@ impl<T: Send + Sync + 'static> Stack<T> {
                 }
             }
         }
-    }
-
-    /// Clears the stack and returns all items
-    pub fn take_iter<'a>(
-        &self,
-        guard: &'a Guard,
-    ) -> impl Iterator<Item = &'a T> {
-        debug_delay();
-        let node = self.head.swap(Shared::null(), Release, guard);
-
-        let iter = Iter { inner: node, guard };
-
-        if !node.is_null() {
-            unsafe {
-                guard.defer_destroy(node);
-            }
-        }
-
-        iter
     }
 
     /// Pop the next item off the stack. Returns None if nothing is there.

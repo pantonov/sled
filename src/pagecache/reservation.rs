@@ -84,7 +84,7 @@ impl<'a> Reservation<'a> {
     /// Will panic if the reservation is not the correct
     /// size to hold a serialized Lsn.
     #[doc(hidden)]
-    pub fn mark_writebatch(&mut self, peg_lsn: Lsn, guard: &Guard) {
+    pub fn mark_writebatch(&mut self, peg_lsn: Lsn) {
         trace!(
             "writing batch required stable lsn {} into \
              BatchManifest at lid {} peg_lsn {}",
@@ -101,7 +101,7 @@ impl<'a> Reservation<'a> {
 
         dst.copy_from_slice(&buf);
 
-        self.log.iobufs.sa_mark_peg(self.lsn, peg_lsn, guard);
+        self.log.iobufs.sa_mark_peg(self.lsn, peg_lsn);
     }
 
     fn flush(&mut self, valid: bool) -> Result<(Lsn, DiskPtr)> {

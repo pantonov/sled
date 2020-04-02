@@ -397,10 +397,10 @@ pub struct RecoveryGuard<'a> {
 impl<'a> RecoveryGuard<'a> {
     /// Writes the last LSN for a batch into an earlier
     /// reservation, releasing it.
-    pub fn seal_batch(mut self, guard: &Guard) -> Result<()> {
+    pub fn seal_batch(mut self) -> Result<()> {
         let max_reserved =
             self.batch_res.log.iobufs.max_reserved_lsn.load(Acquire);
-        self.batch_res.mark_writebatch(max_reserved, guard);
+        self.batch_res.mark_writebatch(max_reserved);
         self.batch_res.complete().map(|_| ())
     }
 }
@@ -937,7 +937,7 @@ impl PageCache {
 
                     assert_ne!(old.last_lsn(), 0);
 
-                    self.log.iobufs.sa_mark_link(pid, cache_info, guard);
+                    self.log.iobufs.sa_mark_link(pid, cache_info);
 
                     // NB complete must happen AFTER calls to SA, because
                     // when the iobuf's n_writers hits 0, we may transition

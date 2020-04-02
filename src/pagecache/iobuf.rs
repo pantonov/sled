@@ -194,7 +194,7 @@ pub(crate) struct IoBufs {
     pub max_header_stable_lsn: Arc<AtomicLsn>,
     pub segment_accountant: Mutex<SegmentAccountant>,
     pub segment_cleaner: SegmentCleaner,
-    deferred_segment_ops: stack::Stack<SegmentOp>,
+    deferred_segment_ops: OpQueue<SegmentOp>,
     #[cfg(feature = "io_uring")]
     pub submission_mutex: Mutex<()>,
     #[cfg(feature = "io_uring")]
@@ -349,7 +349,7 @@ impl IoBufs {
             )),
             segment_accountant: Mutex::new(segment_accountant),
             segment_cleaner,
-            deferred_segment_ops: stack::Stack::default(),
+            deferred_segment_ops: OpQueue::default(),
             #[cfg(feature = "io_uring")]
             submission_mutex: Mutex::new(()),
             #[cfg(feature = "io_uring")]
@@ -361,20 +361,18 @@ impl IoBufs {
         &self,
         peg_start_lsn: Lsn,
         peg_end_lsn: Lsn,
-        guard: &Guard,
     ) {
         let op = SegmentOp::Peg { peg_start_lsn, peg_end_lsn };
-        self.deferred_segment_ops.push(op, guard);
+        self.deferred_segment_ops.push(op);
     }
 
     pub(in crate::pagecache) fn sa_mark_link(
         &self,
         pid: PageId,
         cache_info: CacheInfo,
-        guard: &Guard,
     ) {
         let op = SegmentOp::Link { pid, cache_info };
-        self.deferred_segment_ops.push(op, guard);
+        self.deferred_segment_ops.push(op);
     }
 
     pub(in crate::pagecache) fn sa_mark_replace(
@@ -389,8 +387,8 @@ impl IoBufs {
         if let Some(mut sa) = self.segment_accountant.try_lock() {
             let start = clock();
             sa.mark_replace(pid, lsn, old_cache_infos, new_cache_info)?;
-            for op in self.deferred_segment_ops.take_iter(guard) {
-                sa.apply_op(op)?;
+            for op in self.deferred_segment_ops.take(guard) {
+                sa.apply_op(&op)?;
             }
             M.accountant_hold.measure(clock() - start);
         } else {
@@ -400,7 +398,7 @@ impl IoBufs {
                 old_cache_infos: *old_cache_infos,
                 new_cache_info,
             };
-            self.deferred_segment_ops.push(op, guard);
+            self.deferred_segment_ops.push(op);
         }
         Ok(())
     }
@@ -411,8 +409,8 @@ impl IoBufs {
         guard: &Guard,
     ) -> Result<()> {
         self.with_sa(|sa| {
-            for op in self.deferred_segment_ops.take_iter(guard) {
-                sa.apply_op(op)?;
+            for op in self.deferred_segment_ops.take(guard) {
+                sa.apply_op(&op)?;
             }
             sa.stabilize(lsn)?;
             Ok(())
