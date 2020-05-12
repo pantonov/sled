@@ -10,9 +10,36 @@ mod disk_pointer;
 mod iobuf;
 mod iterator;
 mod pagetable;
-#[cfg(all(not(unix), not(windows)))]
+#[cfg(
+    all(
+        not(
+            any(
+                target_os = "macos",
+                // explicitly do not allow ios here
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "openbsd",
+                target_os = "netbsd",
+            ),
+        ),
+        not(windows),
+    )
+)]
 mod parallel_io_polyfill;
-#[cfg(unix)]
+#[cfg(
+    any(
+        target_os = "macos",
+        // explicitly do not allow ios here
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    )
+)]
 mod parallel_io_unix;
 #[cfg(windows)]
 mod parallel_io_windows;
@@ -23,10 +50,37 @@ mod snapshot;
 use crate::*;
 use std::{collections::BinaryHeap, ops::Deref};
 
-#[cfg(all(not(unix), not(windows)))]
+#[cfg(
+    all(
+        not(
+            any(
+                target_os = "macos",
+                // explicitly do not allow ios here
+                target_os = "linux",
+                target_os = "android",
+                target_os = "freebsd",
+                target_os = "dragonfly",
+                target_os = "openbsd",
+                target_os = "netbsd",
+            ),
+        ),
+        not(windows),
+    )
+)]
 use parallel_io_polyfill::{pread_exact, pread_exact_or_eof, pwrite_all};
 
-#[cfg(unix)]
+#[cfg(
+    any(
+        target_os = "macos",
+        // explicitly do not allow ios here
+        target_os = "linux",
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "netbsd",
+    )
+)]
 use parallel_io_unix::{pread_exact, pread_exact_or_eof, pwrite_all};
 
 #[cfg(windows)]
